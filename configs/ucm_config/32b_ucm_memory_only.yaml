@@ -1,0 +1,7 @@
+ucm_connectors:
+  - ucm_connector_name: "UcmPipelineStore"
+    ucm_connector_config:
+      store_pipeline: "Cache|Posix"
+      storage_backends: "/dev/shm"   # 指向 tmpfs = DRAM
+      io_direct: false
+      cache_buffer_capacity_gb: 96

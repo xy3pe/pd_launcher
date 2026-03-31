@@ -1,0 +1,83 @@
+# Qwen3-8B PD 分离：1 Prefill (TP=1, 卡 3) + 2 Decode (TP=1, 卡 4-5)，共 3 卡
+cluster_name: "Qwen3-32B_1P2_1D2_base"
+
+model:
+  path: "/root/autodl-tmp/models/Qwen3-32B"
+  served_name: "qwen3_32b"
+
+venv:
+  vllm: "/root/autodl-tmp/py_venv/vllm2"
+
+
+log_level: "INFO"  # 日志级别：DEBUG / INFO / WARNING / ERROR
+
+paths:
+  transfer_engine_lib: "/usr/local/lib"
+  python_lib: "/root/.local/share/uv/python/cpython-3.11.15-linux-aarch64-gnu/lib"
+
+# null = 自动探测；显式指定则覆盖
+network:
+  nic_name: null
+  local_ip: null
+
+# vLLM serve 默认参数，所有实例共享；实例级 overrides 可覆盖任意项
+vllm_defaults:
+  dtype: "bfloat16"
+  max_model_len: 32768
+  max_num_batched_tokens: 32768
+  max_num_seqs: 64
+  gpu_memory_utilization: 0.9
+  enforce_eager: true
+  trust_remote_code: true
+  enable_auto_tool_choice: true
+  tool_call_parser: "hermes"
+  seed: 1024
+  omp_num_threads: 10
+
+# Prefill 专属参数（覆盖 vllm_defaults 中的同名项）
+prefill_defaults:
+  enable_chunked_prefill: true
+  max_num_batched_tokens: 32768
+  long-prefill-token-threshold: 1024
+  kv_transfer_config:
+    kv_connector: "CPUOffloadingConnector"
+    kv_role: "kv_producer"
+    kv_connector_extra_config:
+      num_cpu_blocks: 5000
+
+# Decode 专属参数（覆盖 vllm_defaults 中的同名项）
+decode_defaults:
+
+# ─── 端口规划说明 ───
+#
+#   port     — vLLM OpenAI API 服务端口，每个实例必须唯一。
+#              建议：P 从 9000 起，D 从 9010 起，逐实例 +1。
+#
+#   dp_port  — Data-Parallel RPC 端口（VLLM_DP_MASTER_PORT / --data-parallel-rpc-port）。
+#              同角色多实例间通过此端口协调 DP 调度。
+#              规则：同角色所有实例共享同一 dp_port；P 和 D 必须使用不同值。
+#              建议：P 用 13395，D 用 13495。
+#
+# dp_size / dp_rank 由实例列表自动计算，无需手动填写。
+
+prefill:
+  - name: "P0"
+    port: 7000              # API 端口
+    devices: "2,3"
+    tensor_parallel_size: 2
+    dp_port: 13395          # DP RPC（所有 P 共享）
+    hccl_buffsize: 256
+
+decode:
+  - name: "D0"
+    port: 7010
+    devices: "4,5"
+    tensor_parallel_size: 2
+    dp_port: 13495          # DP RPC（所有 D 共享，与 P 不同）
+    hccl_buffsize: 512
+
+
+# 负载均衡代理；设为 null 或删除此段则不启代理
+proxy:
+  port: 9050
+  prefill_only: true
