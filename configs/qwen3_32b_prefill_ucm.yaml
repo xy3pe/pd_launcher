@@ -44,7 +44,7 @@ prefill_defaults:
     kv_connector: "UCMConnector"
     kv_role: "kv_producer"
     kv_connector_extra_config:
-      UCM_CONFIG_FILE: "/root/autodl-tmp/pxy/share/workspace/scripts/pd_disaggregation/configs/ucm_config/32b_ucm_memory_only.yaml"
+      UCM_CONFIG_FILE: "configs/ucm_config/32b_ucm_memory_only.yaml"
 
 # Decode 专属参数（覆盖 vllm_defaults 中的同名项）
 decode_defaults:

@@ -324,6 +324,20 @@ def load_config(path: Path) -> ClusterConfig:
         config_path=Path(path).resolve(),
     )
 
+    # 将 kv_connector_extra_config 中的相对路径解析为绝对路径（基于配置文件所在目录）
+    cfg_dir = Path(path).resolve().parent
+    for role_defaults in (cfg.prefill_defaults, cfg.decode_defaults):
+        kv_cfg = role_defaults.get("kv_transfer_config")
+        if not kv_cfg:
+            continue
+        extra = kv_cfg.get("kv_connector_extra_config")
+        if not extra:
+            continue
+        for key in ("UCM_CONFIG_FILE",):
+            val = extra.get(key)
+            if val and not Path(val).is_absolute():
+                extra[key] = str((cfg_dir / val).resolve())
+
     # 校验
     _validate_config(cfg)
     return cfg

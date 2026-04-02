@@ -252,6 +252,10 @@ class LauncherHandler(BaseHTTPRequestHandler):
             self._list_configs()
         elif p.startswith("/api/configs/"):
             self._get_config(p[len("/api/configs/"):])
+        elif p == "/api/ucm_configs":
+            self._list_ucm_configs()
+        elif p.startswith("/api/ucm_configs/"):
+            self._get_ucm_config(p[len("/api/ucm_configs/"):])
         elif p == "/api/template":
             _json_resp(self, 200, {"content": _DEFAULT_TEMPLATE})
         elif p == "/api/server":
@@ -265,6 +269,8 @@ class LauncherHandler(BaseHTTPRequestHandler):
         p = self.path.split("?")[0].rstrip("/")
         if p == "/api/configs":
             self._save_config()
+        elif p == "/api/ucm_configs":
+            self._save_ucm_config()
         elif p == "/api/server/start":
             self._server_start()
         elif p == "/api/server/stop":
@@ -279,6 +285,8 @@ class LauncherHandler(BaseHTTPRequestHandler):
         p = self.path.split("?")[0].rstrip("/")
         if p.startswith("/api/configs/"):
             self._delete_config(p[len("/api/configs/"):])
+        elif p.startswith("/api/ucm_configs/"):
+            self._delete_ucm_config(p[len("/api/ucm_configs/"):])
         else:
             _json_resp(self, 404, {"error": "not found"})
 
@@ -327,6 +335,50 @@ class LauncherHandler(BaseHTTPRequestHandler):
         p = _configs_dir / f"{stem}.yaml"
         if not p.is_file():
             _json_resp(self, 404, {"error": "config not found"}); return
+        p.unlink()
+        _json_resp(self, 200, {"deleted": stem})
+
+    # ── UCM 配置文件 CRUD ──
+
+    @staticmethod
+    def _ucm_dir() -> Path:
+        return _configs_dir / "ucm_config"
+
+    def _list_ucm_configs(self):
+        ucm_dir = self._ucm_dir()
+        configs = []
+        if ucm_dir.is_dir():
+            for p in sorted(ucm_dir.glob("*.yaml")):
+                configs.append({"name": p.stem, "path": str(p)})
+        _json_resp(self, 200, {"configs": configs})
+
+    def _get_ucm_config(self, name: str):
+        name = urllib.parse.unquote(name)
+        stem = Path(name).stem
+        p = self._ucm_dir() / f"{stem}.yaml"
+        if not p.is_file():
+            _json_resp(self, 404, {"error": "ucm config not found"}); return
+        _json_resp(self, 200, {"name": stem, "path": str(p), "content": p.read_text()})
+
+    def _save_ucm_config(self):
+        d = _read_json(self)
+        name = str(d.get("name", "")).strip()
+        content = str(d.get("content", ""))
+        if not name:
+            _json_resp(self, 400, {"error": "name required"}); return
+        stem = Path(name).stem or name.replace("/", "_")
+        ucm_dir = self._ucm_dir()
+        ucm_dir.mkdir(parents=True, exist_ok=True)
+        p = ucm_dir / f"{stem}.yaml"
+        p.write_text(content)
+        _json_resp(self, 200, {"name": stem, "path": str(p)})
+
+    def _delete_ucm_config(self, name: str):
+        name = urllib.parse.unquote(name)
+        stem = Path(name).stem
+        p = self._ucm_dir() / f"{stem}.yaml"
+        if not p.is_file():
+            _json_resp(self, 404, {"error": "ucm config not found"}); return
         p.unlink()
         _json_resp(self, 200, {"deleted": stem})
 
@@ -503,10 +555,15 @@ button:disabled{opacity:.38;cursor:not-allowed}
 <div class="page active" id="tab-config">
   <div class="sidebar">
     <div class="sidebar-hdr">
-      配置文件
+      集群配置
       <button class="btn-n" style="padding:2px 7px;font-size:10px" onclick="newCfg()">+ 新建</button>
     </div>
     <div class="cfg-list" id="cfg-list"></div>
+    <div class="sidebar-hdr" style="border-top:1px solid var(--border)">
+      UCM 配置
+      <button class="btn-n" style="padding:2px 7px;font-size:10px" onclick="newUcmCfg()">+ 新建</button>
+    </div>
+    <div class="cfg-list" id="ucm-cfg-list"></div>
   </div>
   <div class="cfg-main">
     <div class="name-row">
@@ -602,7 +659,7 @@ function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g
 // ════════════════════════════════════
 // 配置管理
 // ════════════════════════════════════
-let _cfgs=[], _selCfg=null;
+let _cfgs=[], _selCfg=null, _editMode='cluster';
 
 async function loadCfgList(){
   try{
@@ -622,6 +679,7 @@ async function loadCfg(name){
   try{
     const r=await fetch('/api/configs/'+encodeURIComponent(name));
     const d=await r.json();
+    _switchEditMode('cluster');
     _selCfg=name;
     document.getElementById('cfg-name').value=name;
     document.getElementById('editor').value=d.content;
@@ -631,6 +689,7 @@ async function loadCfg(name){
 }
 
 async function newCfg(){
+  _switchEditMode('cluster');
   _selCfg=null;
   document.getElementById('cfg-name').value='';
   document.getElementById('editor').value='';
@@ -647,12 +706,17 @@ async function saveCfg(){
   const name=document.getElementById('cfg-name').value.trim();
   const content=document.getElementById('editor').value;
   if(!name){toast('请输入配置名称','err');return;}
+  const api=_editMode==='ucm'?'/api/ucm_configs':'/api/configs';
   try{
-    const r=await fetch('/api/configs',{method:'POST',
+    const r=await fetch(api,{method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({name,content})});
     const d=await r.json();
-    if(r.ok){_selCfg=name;toast('已保存: '+name,'ok');await loadCfgList();document.getElementById('btn-del').disabled=false;}
+    if(r.ok){
+      if(_editMode==='ucm'){_selUcmCfg=name;await loadUcmCfgList();}
+      else{_selCfg=name;await loadCfgList();}
+      toast('已保存: '+name,'ok');document.getElementById('btn-del').disabled=false;
+    }
     else toast('保存失败: '+(d.error||r.status),'err');
   }catch(e){toast('保存失败: '+e,'err');}
 }
@@ -662,18 +726,23 @@ async function saveAsCfg(){
   const n=prompt('另存为（新配置名）:',orig?(orig+'_copy'):'');
   if(!n)return;
   document.getElementById('cfg-name').value=n.replace(/\\.yaml$/,'');
-  _selCfg=null; await saveCfg();
+  if(_editMode==='ucm')_selUcmCfg=null; else _selCfg=null;
+  await saveCfg();
 }
 
 async function delCfg(){
-  if(!_selCfg)return;
-  if(!confirm('确认删除配置 '+_selCfg+' ?'))return;
+  const sel=_editMode==='ucm'?_selUcmCfg:_selCfg;
+  if(!sel)return;
+  if(!confirm('确认删除配置 '+sel+' ?'))return;
+  const api=_editMode==='ucm'?'/api/ucm_configs/':'/api/configs/';
   try{
-    const r=await fetch('/api/configs/'+encodeURIComponent(_selCfg),{method:'DELETE'});
+    const r=await fetch(api+encodeURIComponent(sel),{method:'DELETE'});
     const d=await r.json();
-    if(r.ok){toast('已删除','ok');_selCfg=null;document.getElementById('cfg-name').value='';
+    if(r.ok){toast('已删除','ok');
+      if(_editMode==='ucm')_selUcmCfg=null; else _selCfg=null;
+      document.getElementById('cfg-name').value='';
       document.getElementById('editor').value='';document.getElementById('btn-del').disabled=true;
-      await loadCfgList();}
+      if(_editMode==='ucm')await loadUcmCfgList(); else await loadCfgList();}
     else toast('删除失败: '+(d.error||r.status),'err');
   }catch(e){toast('删除失败: '+e,'err');}
 }
@@ -682,6 +751,54 @@ function syncSvcCfg(){
   const sel=document.getElementById('svc-cfg');
   const prev=sel.value;
   sel.innerHTML=_cfgs.map(c=>`<option value="${c.path}"${c.path===prev?' selected':''}>${c.name}</option>`).join('');
+}
+
+// ════════════════════════════════════
+// UCM 配置管理
+// ════════════════════════════════════
+let _ucmCfgs=[], _selUcmCfg=null;
+
+async function loadUcmCfgList(){
+  try{
+    const r=await fetch('/api/ucm_configs'); const d=await r.json();
+    _ucmCfgs=d.configs||[]; renderUcmCfgList();
+  }catch(e){}
+}
+
+function renderUcmCfgList(){
+  const el=document.getElementById('ucm-cfg-list');
+  el.innerHTML=_ucmCfgs.map(c=>`<div class="cfg-item${_selUcmCfg===c.name&&_editMode==='ucm'?' sel':''}"
+    onclick="loadUcmCfg('${c.name}')" title="${c.path}">${c.name}</div>`).join('')
+    ||'<div style="padding:10px 12px;color:var(--text-dim);font-size:11px">暂无 UCM 配置</div>';
+}
+
+function _switchEditMode(mode){
+  _editMode=mode;
+  if(mode==='ucm'){_selCfg=null;renderCfgList();}
+  else{_selUcmCfg=null;renderUcmCfgList();}
+}
+
+async function loadUcmCfg(name){
+  try{
+    const r=await fetch('/api/ucm_configs/'+encodeURIComponent(name));
+    const d=await r.json();
+    _switchEditMode('ucm');
+    _selUcmCfg=name;
+    document.getElementById('cfg-name').value=name;
+    document.getElementById('editor').value=d.content;
+    document.getElementById('btn-del').disabled=false;
+    renderUcmCfgList();
+  }catch(e){toast('加载失败: '+e,'err');}
+}
+
+async function newUcmCfg(){
+  _switchEditMode('ucm');
+  _selUcmCfg=null;
+  document.getElementById('cfg-name').value='';
+  document.getElementById('editor').value='';
+  document.getElementById('btn-del').disabled=true;
+  renderUcmCfgList();
+  document.getElementById('cfg-name').focus();
 }
 
 // ════════════════════════════════════
@@ -808,6 +925,7 @@ async function pdStop(){
 // ── 初始化 ──
 async function init(){
   await loadCfgList();
+  await loadUcmCfgList();
   await pollServer();
   setInterval(pollServer,3000);
   setInterval(()=>{pollPD();pollTask();},2000);
