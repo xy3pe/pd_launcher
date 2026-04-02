@@ -21,6 +21,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -222,6 +223,8 @@ class ClusterConfig:
     proxy_port: Optional[int]       # None = 不启代理
     proxy_prefill_only: bool = False  # True = decode 阶段打桩，专用于压测 prefill
     config_path: Optional[Path] = None  # 原始配置文件路径（供 pd_proxy.py start --config 使用）
+    # UCM 缓存
+    drop_ucm_cache: bool = False     # True = 启动前清空 /dev/shm/ucm_cache
     # 就绪等待
     ready_timeout_s: int = 300
     proxy_sleep_s: int = 10
@@ -321,6 +324,7 @@ def load_config(path: Path) -> ClusterConfig:
         decode_instances=decode_instances,
         proxy_port=proxy_port,
         proxy_prefill_only=proxy_prefill_only,
+        drop_ucm_cache=bool(raw.get("drop_ucm_cache", False)),
         config_path=Path(path).resolve(),
     )
 
@@ -920,6 +924,20 @@ echo $! > "{_pid_file(self._cfg.cluster_name, 'proxy')}"
         """
         log_dir = log_dir.resolve()
         log_dir.mkdir(parents=True, exist_ok=True)
+
+        # UCM 缓存目录准备
+        ucm_cache = Path("/dev/shm/ucm_cache")
+        if ucm_cache.is_dir():
+            if self._cfg.drop_ucm_cache:
+                self._log("清空 UCM 缓存目录: /dev/shm/ucm_cache")
+                for child in ucm_cache.iterdir():
+                    if child.is_dir():
+                        shutil.rmtree(child)
+                    else:
+                        child.unlink()
+        else:
+            self._log("创建 UCM 缓存目录: /dev/shm/ucm_cache")
+            ucm_cache.mkdir(parents=True, exist_ok=True)
 
         wp = self.has_proxy if with_proxy is None else with_proxy
         if wp and not self.has_proxy:

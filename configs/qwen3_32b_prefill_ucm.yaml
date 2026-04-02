@@ -10,6 +10,8 @@ venv:
 
 venv_activate: "vllm"  # 激活哪个 venv（对应 venv 段中的 key）
 
+drop_ucm_cache: true   # 启动前清空 /dev/shm/ucm_cache
+
 log_level: "INFO"  # 日志级别：DEBUG / INFO / WARNING / ERROR
 
 paths:
