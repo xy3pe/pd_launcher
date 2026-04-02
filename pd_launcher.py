@@ -531,6 +531,18 @@ button:disabled{opacity:.38;cursor:not-allowed}
 .btn-n{background:var(--btn-n-bg);color:var(--btn-n-text)}
 .btn-n:hover:not(:disabled){background:var(--btn-n-hover)}
 .stext{font-size:11px;color:var(--text-muted);margin-top:6px}
+/* logs tab */
+#tab-logs{flex-direction:column;padding:14px;gap:0;overflow:hidden}
+.log-tabs{display:flex;gap:2px;padding-bottom:10px;flex-shrink:0;overflow-x:auto;border-bottom:1px solid var(--border)}
+.log-tab{padding:5px 12px;border-radius:4px 4px 0 0;font-size:12px;cursor:pointer;color:var(--text-muted);border:none;background:transparent;white-space:nowrap}
+.log-tab.active{background:var(--surface);color:var(--accent);border:1px solid var(--border);border-bottom-color:var(--surface)}
+.log-tab .ltdot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:4px;vertical-align:middle}
+.log-tab .ltdot.on{background:var(--dot-on)}
+.log-tab .ltdot.off{background:var(--dot-off)}
+.log-toolbar{display:flex;align-items:center;gap:8px;padding:8px 0;flex-shrink:0}
+.log-toolbar select{width:auto;padding:3px 6px;font-size:11px}
+.log-content{flex:1;overflow-y:auto;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px;font-family:'Cascadia Code','Fira Code',monospace;font-size:11.5px;line-height:1.55;color:var(--text-body);white-space:pre-wrap;word-break:break-all}
+.log-content .log-ts{color:var(--text-dim)}
 .toast{position:fixed;bottom:18px;right:18px;padding:9px 14px;border-radius:5px;font-size:12px;z-index:999;opacity:0;transition:opacity .25s;pointer-events:none}
 .toast.show{opacity:1}
 .toast.ok{background:var(--toast-ok-bg);color:var(--toast-ok-text)}
@@ -543,6 +555,7 @@ button:disabled{opacity:.38;cursor:not-allowed}
   <div class="tabs">
     <button class="tab active" onclick="gotoTab('config')">配置管理</button>
     <button class="tab" onclick="gotoTab('service')">服务控制</button>
+    <button class="tab" onclick="gotoTab('logs')">服务日志</button>
   </div>
   <div class="srv-badge">
     <div class="dot" id="srv-dot"></div>
@@ -624,6 +637,31 @@ button:disabled{opacity:.38;cursor:not-allowed}
   </div>
 </div>
 
+<!-- ══ Tab: 服务日志 ══ -->
+<div class="page" id="tab-logs">
+  <div class="log-tabs" id="log-tabs">
+    <span style="color:var(--text-dim);font-size:11px;padding:5px 8px">启动服务后查看日志</span>
+  </div>
+  <div class="log-toolbar">
+    <label style="margin:0;font-size:11px;color:var(--text-muted)">显示行数</label>
+    <select id="log-tail-n">
+      <option value="100">100</option>
+      <option value="200" selected>200</option>
+      <option value="500">500</option>
+      <option value="1000">1000</option>
+      <option value="2000">2000</option>
+    </select>
+    <button class="btn-n" style="padding:3px 8px;font-size:11px" onclick="fetchActiveLog()">刷新</button>
+    <label style="margin:0;display:flex;align-items:center;gap:4px;font-size:11px;color:var(--text-muted);cursor:pointer;margin-left:auto">
+      <input type="checkbox" id="log-auto-refresh" checked style="width:auto">自动刷新
+    </label>
+    <label style="margin:0;display:flex;align-items:center;gap:4px;font-size:11px;color:var(--text-muted);cursor:pointer">
+      <input type="checkbox" id="log-auto-scroll2" checked style="width:auto">自动滚动
+    </label>
+  </div>
+  <div class="log-content" id="log-content"></div>
+</div>
+
 <div class="toast" id="toast"></div>
 <script>
 // ── theme ──
@@ -640,11 +678,12 @@ applyTheme(localStorage.getItem('pd-theme')||'dark');
 
 // ── tabs ──
 function gotoTab(name) {
-  ['config','service'].forEach((n,i) => {
+  ['config','service','logs'].forEach((n,i) => {
     document.getElementById('tab-'+n).classList.toggle('active', n===name);
     document.querySelectorAll('.tab')[i].classList.toggle('active', n===name);
   });
   if (name==='service') syncSvcCfg();
+  if (name==='logs') refreshLogTabs();
 }
 
 // ── toast ──
@@ -921,6 +960,88 @@ async function pdStop(){
     else toast(d.error||'操作失败','err');
   }catch(e){toast('请求失败: '+e,'err');}
 }
+
+// ════════════════════════════════════
+// 服务日志
+// ════════════════════════════════════
+let _logFiles=[], _activeLog=null, _logInstStatus={};
+
+async function refreshLogTabs(){
+  // 获取日志文件列表和实例状态
+  try{
+    const [lr, sr] = await Promise.all([
+      fetch('/pd/logs').then(r=>r.ok?r.json():null).catch(()=>null),
+      fetch('/pd/status').then(r=>r.ok?r.json():null).catch(()=>null)
+    ]);
+    if(lr && lr.files) _logFiles=lr.files;
+    else _logFiles=[];
+    // 构建 name→alive 映射
+    _logInstStatus={};
+    if(sr && sr.instances){
+      sr.instances.forEach(i=>{
+        const logName = i.role==='proxy'?'proxy':(i.role+'_'+i.name);
+        _logInstStatus[logName]=i.alive;
+      });
+    }
+  }catch(e){_logFiles=[];}
+  renderLogTabs();
+  if(_logFiles.length>0 && (!_activeLog || !_logFiles.find(f=>f.name===_activeLog))){
+    _activeLog=_logFiles[0].name;
+  }
+  renderLogTabs();
+  if(_activeLog) await fetchActiveLog();
+}
+
+function renderLogTabs(){
+  const el=document.getElementById('log-tabs');
+  if(_logFiles.length===0){
+    el.innerHTML='<span style="color:var(--text-dim);font-size:11px;padding:5px 8px">启动服务后查看日志</span>';
+    return;
+  }
+  el.innerHTML=_logFiles.map(f=>{
+    const alive=_logInstStatus[f.name];
+    const dotClass=alive===true?'on':(alive===false?'off':'');
+    const sel=_activeLog===f.name?' active':'';
+    return `<button class="log-tab${sel}" onclick="switchLog('${f.name}')"><span class="ltdot ${dotClass}"></span>${f.name}</button>`;
+  }).join('');
+}
+
+function switchLog(name){
+  _activeLog=name;
+  renderLogTabs();
+  fetchActiveLog();
+}
+
+async function fetchActiveLog(){
+  if(!_activeLog)return;
+  const tail=document.getElementById('log-tail-n').value;
+  try{
+    const r=await fetch('/pd/logs/'+encodeURIComponent(_activeLog)+'?tail='+tail);
+    if(!r.ok){document.getElementById('log-content').textContent='加载失败';return;}
+    const d=await r.json();
+    const box=document.getElementById('log-content');
+    box.innerHTML=(d.lines||[]).map(l=>{
+      const i=l.indexOf(' ',11);
+      if(i>0)return '<span class="log-ts">'+esc(l.substring(0,i))+'</span> '+esc(l.substring(i+1));
+      return esc(l);
+    }).join('\\n');
+    if(document.getElementById('log-auto-scroll2').checked) box.scrollTop=box.scrollHeight;
+  }catch(e){document.getElementById('log-content').textContent='请求失败: '+e;}
+}
+
+// 自动刷新日志
+setInterval(()=>{
+  if(!document.getElementById('tab-logs').classList.contains('active'))return;
+  if(!document.getElementById('log-auto-refresh').checked)return;
+  fetchActiveLog();
+  // 同步实例状态（较低频率在 refreshLogTabs 中已做）
+},3000);
+
+// 每 10s 刷新日志文件列表和实例状态
+setInterval(()=>{
+  if(!document.getElementById('tab-logs').classList.contains('active'))return;
+  refreshLogTabs();
+},10000);
 
 // ── 初始化 ──
 async function init(){

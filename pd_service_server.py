@@ -391,6 +391,7 @@ class ServiceState:
         self._op_lock = threading.Lock()
         self._current_task: Optional[Task] = None
         self._history: Deque[Task] = deque(maxlen=_TASK_HISTORY_SIZE)
+        self.log_dir: Optional[Path] = None  # 最近一次 start 使用的日志目录
 
     # ---------- 查询 ----------
 
@@ -507,6 +508,32 @@ def _add_cors_headers(handler: BaseHTTPRequestHandler) -> None:
     handler.send_header("Access-Control-Allow-Headers", "Content-Type")
 
 
+def _tail_file(path: Path, n: int) -> List[str]:
+    """高效读取文件末尾 n 行（从文件尾部向前扫描）。"""
+    try:
+        size = path.stat().st_size
+        if size == 0:
+            return []
+        with open(path, "rb") as f:
+            # 对于小文件直接全部读取
+            if size <= 256 * 1024:
+                lines = f.read().decode(errors="replace").splitlines()
+                return lines[-n:]
+            # 大文件从尾部分块读取
+            buf = b""
+            chunk = min(size, 64 * 1024)
+            pos = size
+            while pos > 0 and buf.count(b"\n") <= n:
+                read_size = min(chunk, pos)
+                pos -= read_size
+                f.seek(pos)
+                buf = f.read(read_size) + buf
+            lines = buf.decode(errors="replace").splitlines()
+            return lines[-n:]
+    except Exception:
+        return []
+
+
 def _json_response(handler: BaseHTTPRequestHandler, code: int, body: Any) -> None:
     data = json.dumps(body, ensure_ascii=False, indent=2).encode()
     handler.send_response(code)
@@ -553,6 +580,8 @@ class PdControlHandler(BaseHTTPRequestHandler):
             self._configs()
         elif path == "/task" or path.startswith("/task/"):
             self._get_task(path)
+        elif path == "/logs" or path.startswith("/logs/"):
+            self._get_logs(path)
         else:
             _json_response(self, 404, {"error": f"unknown path: {self.path}"})
 
@@ -601,6 +630,51 @@ class PdControlHandler(BaseHTTPRequestHandler):
             return
         _json_response(self, 200, task.to_dict())
 
+    def _get_logs(self, path: str):
+        """返回指定实例的日志文件内容（尾部 N 行）。
+
+        GET /logs          — 返回可用日志文件列表
+        GET /logs/<name>   — 返回指定实例日志（支持 ?tail=500）
+        """
+        log_dir = _state.log_dir
+        if log_dir is None or not log_dir.is_dir():
+            _json_response(self, 404, {"error": "日志目录不存在，请先启动服务"})
+            return
+
+        parts = [p for p in path.split("/") if p]  # ["logs"] or ["logs", "<name>"]
+        if len(parts) < 2:
+            # 列出可用日志文件
+            files = []
+            for f in sorted(log_dir.glob("*.log")):
+                files.append({"name": f.stem, "file": f.name, "size": f.stat().st_size})
+            _json_response(self, 200, {"log_dir": str(log_dir), "files": files})
+            return
+
+        name = parts[1]
+        # 解析 ?tail=N
+        tail = 200
+        qs = self.path.split("?", 1)
+        if len(qs) == 2:
+            for param in qs[1].split("&"):
+                if param.startswith("tail="):
+                    try:
+                        tail = max(1, min(int(param[5:]), 5000))
+                    except ValueError:
+                        pass
+
+        log_file = log_dir / f"{name}.log"
+        if not log_file.is_file():
+            _json_response(self, 404, {"error": f"日志文件不存在: {name}.log"})
+            return
+
+        try:
+            lines = _tail_file(log_file, tail)
+        except Exception as e:
+            _json_response(self, 500, {"error": f"读取日志失败: {e}"})
+            return
+
+        _json_response(self, 200, {"name": name, "lines": lines, "tail": tail})
+
     # ---------- POST ----------
 
     def do_POST(self):
@@ -629,6 +703,8 @@ class PdControlHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 _json_response(self, 400, {"error": f"加载配置失败: {exc}"})
                 return
+
+        _state.log_dir = log_dir.resolve()
 
         def fn(task: Task) -> int:
             return PdServiceCtl(_state.cfg, log=task.log).start_stack(
