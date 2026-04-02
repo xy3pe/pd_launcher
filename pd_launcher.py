@@ -48,6 +48,8 @@ model:
 venv:
   vllm: "/root/autodl-tmp/py_venv/vllm2"
 
+venv_activate: "vllm"  # 激活哪个 venv（对应 venv 段中的 key）
+
 log_level: "INFO"
 
 paths:

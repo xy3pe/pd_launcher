@@ -6,8 +6,10 @@ model:
   served_name: "qwen3_32b"
 
 venv:
-  vllm: "/root/autodl-tmp/pxy/venv/pxy_dev"
+  vllm: "/root/autodl-tmp/py_venv/vllm2"
+  pxy_dev: "/root/autodl-tmp/pxy/venv/pxy_dev"
 
+venv_activate: "pxy_dev"  # 激活哪个 venv（对应 venv 段中的 key）
 
 log_level: "INFO"  # 日志级别：DEBUG / INFO / WARNING / ERROR
 

@@ -201,7 +201,8 @@ class ClusterConfig:
     cluster_name: str
     model_path: str
     served_model_name: str
-    vllm_venv: Path
+    venvs: Dict[str, Path]          # 所有可用 venv，key = 名称，value = 路径
+    venv_activate: str               # 当前激活的 venv 名称（必须是 venvs 的 key）
     # 日志
     log_level: str              # DEBUG / INFO / WARNING / ERROR
     # 路径
@@ -224,6 +225,11 @@ class ClusterConfig:
     # 就绪等待
     ready_timeout_s: int = 300
     proxy_sleep_s: int = 10
+
+    @property
+    def active_venv(self) -> Path:
+        """返回当前激活的 venv 路径。"""
+        return self.venvs[self.venv_activate]
 
 
 # ---------------------------------------------------------------------------
@@ -278,15 +284,31 @@ def load_config(path: Path) -> ClusterConfig:
     proxy_port = proxy_raw["port"] if proxy_raw else None
     proxy_prefill_only = bool(proxy_raw.get("prefill_only", False)) if proxy_raw else False
 
-    # venv
-    venv = raw.get("venv") or {}
+    # venv：支持多个 venv，通过 venv_activate 指定激活哪一个
+    venv_raw = raw.get("venv") or {}
+    venvs = {k: Path(v) for k, v in venv_raw.items()}
+    venv_activate = raw.get("venv_activate")
+    if not venvs:
+        raise ValueError("配置缺少 venv 段，至少需要定义一个 venv")
+    if venv_activate is None:
+        # 未指定时：若只有一个 venv 则自动选中，否则报错
+        if len(venvs) == 1:
+            venv_activate = next(iter(venvs))
+        else:
+            raise ValueError(
+                f"定义了多个 venv ({', '.join(venvs)}), 必须通过 venv_activate 指定激活哪一个"
+            )
+    if venv_activate not in venvs:
+        raise ValueError(f"venv_activate={venv_activate!r} 未在 venv 中定义，可选: {', '.join(venvs)}")
+
     paths = raw.get("paths") or {}
 
     cfg = ClusterConfig(
         cluster_name=raw.get("cluster_name", "unnamed"),
         model_path=raw["model"]["path"],
         served_model_name=raw["model"].get("served_name", "default"),
-        vllm_venv=Path(venv["vllm"]),
+        venvs=venvs,
+        venv_activate=venv_activate,
         log_level=raw.get("log_level", "INFO").upper(),
         transfer_engine_lib=paths.get("transfer_engine_lib", "/usr/local/lib"),
         python_lib=paths.get("python_lib", ""),
@@ -686,7 +708,7 @@ def _build_vllm_args(cfg: ClusterConfig, inst: InstanceConfig) -> List[str]:
 def _build_proxy_args(cfg: ClusterConfig) -> List[str]:
     """构建内置代理 pd_proxy.py 的启动参数列表。"""
     proxy_script = PKG_DIR / "pd_proxy.py"
-    venv_python = cfg.vllm_venv / "bin" / "python3"
+    venv_python = cfg.active_venv / "bin" / "python3"
     config_path = cfg.config_path or proxy_script.parent  # 兜底：不应发生
     return [str(venv_python), str(proxy_script), "start", "--config", str(config_path)]
 
@@ -781,7 +803,7 @@ class PdServiceCtl:
         args = _build_vllm_args(self._cfg, inst)
         log_file = _instance_log_file(inst, log_dir)
 
-        venv_activate = self._cfg.vllm_venv / "bin" / "activate"
+        venv_activate = self._cfg.active_venv / "bin" / "activate"
         if not venv_activate.is_file():
             raise FileNotFoundError(f"venv activate 不存在: {venv_activate}")
 
