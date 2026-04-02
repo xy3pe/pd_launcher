@@ -14,9 +14,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import signal
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -29,10 +32,15 @@ from typing import Any, Dict, Optional, Tuple
 # ---------------------------------------------------------------------------
 
 _configs_dir: Path = Path("configs")
-_server_proc: Optional[subprocess.Popen] = None
+_server_pid: Optional[int] = None      # pd_service_server 进程 PID
 _server_port: Optional[int] = None
 _server_config: Optional[str] = None
 _lock = threading.Lock()
+
+_http_server: Optional[HTTPServer] = None   # 当前 HTTPServer 实例（供热更新关闭）
+_reload_requested = False                   # 热更新标志
+
+_STATE_FILE = Path(__file__).resolve().parent / ".launcher_state.json"
 
 # ---------------------------------------------------------------------------
 # 默认配置模板
@@ -107,33 +115,70 @@ proxy:
 """
 
 # ---------------------------------------------------------------------------
-# 服务器管理
+# 服务器管理（PID 模式，支持热更新后恢复）
 # ---------------------------------------------------------------------------
 
 
-def _get_server_status() -> Dict[str, Any]:
-    global _server_proc, _server_port, _server_config
+def _pid_alive(pid: int) -> bool:
+    """检查 PID 对应的进程是否存活。"""
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _save_server_state() -> None:
+    """将 pd_service_server 状态写入文件，供热更新后恢复。"""
     with _lock:
-        if _server_proc is None:
+        state: Dict[str, Any] = {}
+        if _server_pid is not None and _pid_alive(_server_pid):
+            state = {"pid": _server_pid, "port": _server_port, "config": _server_config}
+    try:
+        _STATE_FILE.write_text(json.dumps(state))
+    except OSError:
+        pass
+
+
+def _recover_server_state() -> None:
+    """热更新启动时，从状态文件恢复 pd_service_server 引用。"""
+    global _server_pid, _server_port, _server_config
+    if not _STATE_FILE.is_file():
+        return
+    try:
+        state = json.loads(_STATE_FILE.read_text())
+        pid = state.get("pid")
+        if pid and _pid_alive(pid):
+            _server_pid = pid
+            _server_port = state.get("port")
+            _server_config = state.get("config")
+            print(f"[热更新] 恢复控制服务器连接 (PID {pid}，端口 {_server_port})")
+    except (json.JSONDecodeError, OSError, KeyError):
+        pass
+
+
+def _get_server_status() -> Dict[str, Any]:
+    global _server_pid, _server_port, _server_config
+    with _lock:
+        if _server_pid is None:
             return {"running": False, "pid": None, "port": None, "config": None}
-        rc = _server_proc.poll()
-        if rc is not None:
-            _server_proc = None
+        if not _pid_alive(_server_pid):
+            _server_pid = None
             _server_port = None
             _server_config = None
             return {"running": False, "pid": None, "port": None, "config": None}
         return {
             "running": True,
-            "pid": _server_proc.pid,
+            "pid": _server_pid,
             "port": _server_port,
             "config": _server_config,
         }
 
 
 def _start_pd_server(config_path: str, port: int) -> Tuple[bool, str]:
-    global _server_proc, _server_port, _server_config
+    global _server_pid, _server_port, _server_config
     with _lock:
-        if _server_proc is not None and _server_proc.poll() is None:
+        if _server_pid is not None and _pid_alive(_server_pid):
             return False, "控制服务器已在运行"
         script = Path(__file__).parent / "pd_service_server.py"
         if not script.is_file():
@@ -142,7 +187,7 @@ def _start_pd_server(config_path: str, port: int) -> Tuple[bool, str]:
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                                     stderr=subprocess.DEVNULL, start_new_session=True)
-            _server_proc = proc
+            _server_pid = proc.pid
             _server_port = port
             _server_config = config_path
             return True, f"控制服务器已启动 (PID {proc.pid}，端口 {port})"
@@ -151,21 +196,24 @@ def _start_pd_server(config_path: str, port: int) -> Tuple[bool, str]:
 
 
 def _stop_pd_server() -> Tuple[bool, str]:
-    global _server_proc, _server_port, _server_config
+    global _server_pid, _server_port, _server_config
     with _lock:
-        if _server_proc is None or _server_proc.poll() is not None:
-            _server_proc = None
+        if _server_pid is None or not _pid_alive(_server_pid):
+            _server_pid = None
             _server_port = None
             _server_config = None
             return False, "控制服务器未运行"
-        pid = _server_proc.pid
+        pid = _server_pid
         try:
-            _server_proc.terminate()
-            try:
-                _server_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                _server_proc.kill()
-            _server_proc = None
+            os.kill(pid, signal.SIGTERM)
+            # 等待退出
+            for _ in range(50):
+                time.sleep(0.1)
+                if not _pid_alive(pid):
+                    break
+            else:
+                os.kill(pid, signal.SIGKILL)
+            _server_pid = None
             _server_port = None
             _server_config = None
             return True, f"控制服务器已停止 (PID {pid})"
@@ -181,7 +229,7 @@ def _stop_pd_server() -> Tuple[bool, str]:
 def _proxy(method: str, pd_path: str, body: bytes, content_type: str) -> Tuple[int, bytes, str]:
     with _lock:
         port = _server_port
-        alive = _server_proc is not None and _server_proc.poll() is None
+        alive = _server_pid is not None and _pid_alive(_server_pid)
     if not alive or port is None:
         return 503, json.dumps({"error": "控制服务器未运行"}).encode(), "application/json"
     url = f"http://127.0.0.1:{port}{pd_path}"
@@ -1058,12 +1106,54 @@ init();
 """
 
 # ---------------------------------------------------------------------------
+# 热更新
+# ---------------------------------------------------------------------------
+
+
+def _file_watcher(watch_dir: Path, interval: float = 1.0) -> None:
+    """
+    监控 watch_dir 下所有 .py 文件的修改时间。
+    检测到变更后设置 _reload_requested 并关闭 HTTP 服务器，触发主线程重启。
+    """
+    global _reload_requested
+
+    mtimes: Dict[str, float] = {}
+    for f in watch_dir.glob("*.py"):
+        try:
+            mtimes[str(f)] = f.stat().st_mtime
+        except OSError:
+            pass
+
+    while True:
+        time.sleep(interval)
+        changed: list[str] = []
+        for f in watch_dir.glob("*.py"):
+            key = str(f)
+            try:
+                mt = f.stat().st_mtime
+            except OSError:
+                continue
+            if key not in mtimes or mt != mtimes[key]:
+                changed.append(f.name)
+                mtimes[key] = mt
+
+        if changed:
+            names = ", ".join(changed)
+            print(f"\n[热更新] 检测到文件变更: {names}，重启中...")
+            _reload_requested = True
+            _save_server_state()
+            if _http_server is not None:
+                _http_server.shutdown()     # 使 serve_forever() 返回
+            return
+
+
+# ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
 
 
 def main() -> None:
-    global _configs_dir
+    global _configs_dir, _http_server
 
     parser = argparse.ArgumentParser(
         description="PD 推理服务 Web 启动器",
@@ -1073,20 +1163,44 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8080, help="监听端口")
     parser.add_argument("--configs", type=Path, default=Path("configs"),
                         dest="configs_dir", help="配置文件目录")
+    parser.add_argument("--reload", action="store_true",
+                        help="启用热更新：检测 .py 文件变更后自动重启")
     args = parser.parse_args()
 
     _configs_dir = args.configs_dir.resolve()
 
-    print(f"PD Launcher 启动  http://{args.host}:{args.port}")
+    # 热更新启动时尝试恢复 pd_service_server 连接
+    _recover_server_state()
+
+    reload_tag = " [热更新模式]" if args.reload else ""
+    print(f"PD Launcher 启动  http://{args.host}:{args.port}{reload_tag}")
     print(f"配置目录: {_configs_dir}")
     print("在浏览器打开上述地址即可使用")
 
+    HTTPServer.allow_reuse_address = True
     server = HTTPServer((args.host, args.port), LauncherHandler)
+    _http_server = server
+
+    # 启动文件监控线程
+    if args.reload:
+        watcher = threading.Thread(
+            target=_file_watcher,
+            args=(Path(__file__).resolve().parent,),
+            daemon=True,
+        )
+        watcher.start()
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n启动器停止。")
         _stop_pd_server()
+        return
+
+    # serve_forever 正常返回 → 由热更新触发
+    if _reload_requested:
+        server.server_close()
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 if __name__ == "__main__":
